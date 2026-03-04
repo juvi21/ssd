@@ -143,6 +143,8 @@ Contributions welcome!
 
 ## Citation
 
+Speculative Speculative Decoding will appear at ICLR 2026.
+
 ```bibtex
 @misc{kumar2026speculativespeculativedecoding,
       title={Speculative Speculative Decoding},
