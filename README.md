@@ -5,11 +5,30 @@
 </h3>
 
 <p align="center">
-  <img width="1014"
+  <img width="800"
        src="https://github.com/user-attachments/assets/4a38ae2d-e809-41ed-881e-fa94af820a17" />
 </p>
 
-SSD is a new LLM inference algorithm aimed at making decoding faster. This is a lightweight inference engine custom built to implement SSD. It also supports autoregressive decoding and vanilla speculative decoding as baselines, using the Llama-3 and Qwen-3 model families. 
+SSD is a new LLM inference algorithm. It is exact, and it is extremely fast. 
+
+This custom inference engine supports: 
+- A detailed and performant implementation of the SSD algorithm
+- Optimized SD and autoregressive baselines
+- Qwen3 + Llama3 model families
+- Tensor Paralellism
+- PagedAttention, CUDAgraphs, torch compilation, prefix caching
+
+As a result, SSD achieves up to 2x faster inference than some of the strongest inference baselines in the world. 
+
+<div align="center">
+  <table><tr><td width="800">
+    <video src="https://github.com/user-attachments/assets/588eaa70-d6e5-4522-9e94-e54fc6074aba" />
+  </td></tr></table>
+</div>
+
+SSD is conceptually a new type of speculative decoding (SD) where drafting and verification, usually sequential processes with a serial dependence, are parallelized. 
+Doing this presents a number of challenges, and the focus of the paper and codebase is in resolving these challenges to get maximal performance. 
+SSD, like SD, is lossless, i.e. will sample from the same distribution as autoregressive decoding. 
 
 ## Setup
 
