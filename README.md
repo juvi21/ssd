@@ -15,7 +15,7 @@ This custom inference engine supports:
 - A detailed and performant implementation of the SSD algorithm
 - Optimized SD and autoregressive baselines
 - Qwen3 + Llama3 model families
-- Tensor Paralellism
+- Tensor Parallelism
 - PagedAttention, CUDAgraphs, torch compilation, prefix caching
 
 As a result, SSD achieves up to 2x faster inference than some of the strongest inference baselines in the world. 
