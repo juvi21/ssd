@@ -5,6 +5,7 @@ import torch.distributed as dist
 import dataclasses
 
 from ssd.engine.model_runner import ModelRunner
+from ssd.engine.sequence import Sequence
 from ssd.config import Config
 from ssd.utils.context import set_context, reset_context
 from ssd.utils.async_helpers.async_spec_helpers import get_forked_recovery_tokens_from_logits, make_glue_decode_input_ids
@@ -120,6 +121,167 @@ class DraftRunner(ModelRunner):
         self._arange_mq = torch.arange(MQ_LEN, device=d, dtype=torch.int64)
         self._arange_kp1 = torch.arange(K + 1, device=d, dtype=torch.int64)
         self._arange_2kp1 = torch.arange(2 * K + 1, device=d, dtype=torch.int64)
+
+    def _is_kimi_async(self) -> bool:
+        return self.draft_async and getattr(self.hf_config, "model_type", None) == "kimi_linear"
+
+    def _next_kimi_temp_seq_id(self) -> int:
+        next_id = getattr(self, "_kimi_temp_seq_id", 0) - 1
+        self._kimi_temp_seq_id = next_id
+        return next_id
+
+    def _trim_block_table(self, block_table: torch.Tensor | list[int]) -> list[int]:
+        if isinstance(block_table, torch.Tensor):
+            return [int(block) for block in block_table.tolist() if int(block) >= 0]
+        return [int(block) for block in block_table if int(block) >= 0]
+
+    def _split_full_input_ids(self, input_ids: torch.Tensor, num_tokens: torch.Tensor) -> list[list[int]]:
+        seq_tokens = []
+        offset = 0
+        for seqlen in num_tokens.tolist():
+            next_offset = offset + int(seqlen)
+            seq_tokens.append(input_ids[offset:next_offset].tolist())
+            offset = next_offset
+        return seq_tokens
+
+    def _make_kimi_temp_seq(
+        self,
+        token_ids: list[int],
+        draft_block_table: list[int],
+        temperature: float,
+    ) -> Sequence:
+        seq = Sequence(token_ids)
+        seq.seq_id = self._next_kimi_temp_seq_id()
+        seq.block_table = list(draft_block_table)
+        seq.draft_block_table = list(draft_block_table)
+        seq.num_cached_tokens = 0
+        seq.num_draft_cached_tokens = 0
+        seq.num_prompt_tokens = len(token_ids)
+        seq.temperature = float(temperature)
+        seq.draft_temperature = None
+        return seq
+
+    def _run_kimi_full_batch(
+        self,
+        prefix_token_lists: list[list[int]],
+        draft_block_tables: list[list[int]],
+        temperatures: list[float],
+        *,
+        sample: bool,
+    ) -> tuple[list[int], torch.Tensor]:
+        if not prefix_token_lists:
+            empty_logits = torch.empty(
+                (0, self.hf_config.vocab_size),
+                dtype=self.hf_config.torch_dtype,
+                device=self.device,
+            )
+            return [], empty_logits
+
+        if not (len(prefix_token_lists) == len(draft_block_tables) == len(temperatures)):
+            raise ValueError("Kimi draft batch inputs must have matching lengths.")
+
+        temp = 0.0 if not sample else None
+        seqs = [
+            self._make_kimi_temp_seq(tokens, block_table, temperature if temp is None else temp)
+            for tokens, block_table, temperature in zip(prefix_token_lists, draft_block_tables, temperatures)
+        ]
+        try:
+            input_ids, positions = self.prepare_prefill(seqs)
+            logits = self.run_model(input_ids, positions, is_prefill=True, last_only=True)
+            if sample:
+                sample_temps = torch.tensor(
+                    [seq.temperature for seq in seqs],
+                    dtype=torch.float32,
+                    device=self.device,
+                )
+                sampled_tokens = self.sampler(logits, sample_temps).tolist()
+            else:
+                sampled_tokens = logits.argmax(dim=-1).tolist()
+            reset_context()
+            return sampled_tokens, logits
+        finally:
+            reset_context()
+            self.cleanup_seq_states([seq.seq_id for seq in seqs])
+
+    def _generate_kimi_from_prefixes(
+        self,
+        prefix_token_lists: list[list[int]],
+        draft_block_tables: list[list[int]],
+        temperatures: list[float],
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        batch_size = len(prefix_token_lists)
+        K = self.config.speculate_k
+        vocab_size = self.hf_config.vocab_size
+        if batch_size == 0:
+            empty_tokens = torch.empty((0, K), dtype=torch.int64, device=self.device)
+            empty_logits = torch.empty(
+                (0, K, vocab_size),
+                dtype=self.hf_config.torch_dtype,
+                device=self.device,
+            )
+            return empty_tokens, empty_logits
+
+        current_prefixes = [list(tokens) for tokens in prefix_token_lists]
+        out_tokens = torch.empty((batch_size, K), dtype=torch.int64, device=self.device)
+        out_logits = torch.empty(
+            (batch_size, K, vocab_size),
+            dtype=self.hf_config.torch_dtype,
+            device=self.device,
+        )
+        for step in range(K):
+            sampled_tokens, logits = self._run_kimi_full_batch(
+                current_prefixes,
+                draft_block_tables,
+                temperatures,
+                sample=True,
+            )
+            out_tokens[:, step] = torch.tensor(
+                sampled_tokens,
+                dtype=torch.int64,
+                device=self.device,
+            )
+            out_logits[:, step] = logits
+            for prefix, token in zip(current_prefixes, sampled_tokens):
+                prefix.append(int(token))
+
+        return out_tokens, out_logits
+
+    def _compute_kimi_path_logits(
+        self,
+        prefix_token_lists: list[list[int]],
+        draft_block_tables: list[list[int]],
+        returned_tokens: torch.Tensor,
+    ) -> torch.Tensor:
+        batch_size = len(prefix_token_lists)
+        K = self.config.speculate_k
+        vocab_size = self.hf_config.vocab_size
+        current_prefixes = [list(tokens) for tokens in prefix_token_lists]
+        path_tokens = returned_tokens.tolist()
+        zero_temps = [0.0] * batch_size
+        logits = torch.empty(
+            (batch_size, K + 1, vocab_size),
+            dtype=self.hf_config.torch_dtype,
+            device=self.device,
+        )
+        for step in range(K):
+            _, step_logits = self._run_kimi_full_batch(
+                current_prefixes,
+                draft_block_tables,
+                zero_temps,
+                sample=False,
+            )
+            logits[:, step] = step_logits
+            for prefix, token in zip(current_prefixes, [tokens[step] for tokens in path_tokens]):
+                prefix.append(int(token))
+
+        _, final_logits = self._run_kimi_full_batch(
+            current_prefixes,
+            draft_block_tables,
+            zero_temps,
+            sample=False,
+        )
+        logits[:, K] = final_logits
+        return logits
 
     def jit_speculate(self, 
                       request_keys: torch.Tensor, 
@@ -285,14 +447,149 @@ class DraftRunner(ModelRunner):
         
         return out_tokens, out_logits, make_glue_decode_input_ids(out_tokens, rec_toks), cache_hits, out_activations
 
+    def _serve_kimi_request_from_cache(
+        self,
+        cache_keys: torch.Tensor,
+        num_tokens: torch.Tensor,
+        temperatures: torch.Tensor,
+        draft_block_tables: torch.Tensor,
+        full_input_ids: torch.Tensor,
+    ):
+        global ttl, ttl_hit
+
+        B, K = cache_keys.shape[0], self.config.speculate_k
+        V = self.hf_config.vocab_size
+        out_logits = torch.empty(
+            (B, K, V),
+            dtype=self.hf_config.torch_dtype,
+            device=self.device,
+        )
+        out_tokens = torch.empty((B, K), dtype=torch.int64, device=self.device)
+        cache_hits = torch.zeros(B, dtype=torch.int64, device=self.device)
+
+        ttl += int(B)
+        full_token_lists = self._split_full_input_ids(full_input_ids, num_tokens)
+        trimmed_block_tables = [self._trim_block_table(row) for row in draft_block_tables]
+
+        if self.tree_cache_keys.numel() > 0:
+            eq = (cache_keys.unsqueeze(1) == self.tree_cache_keys.unsqueeze(0))
+            match = torch.all(eq, dim=2)
+            cache_hits = match.any(dim=1).to(torch.int64)
+            ttl_hit += int(cache_hits.sum().item())
+            if cache_hits.any():
+                idx = match.float().argmax(dim=1).to(torch.int64)
+                sel = cache_hits.bool()
+                out_tokens[sel] = self.tree_cache_tokens[idx[sel]]
+                out_logits[sel] = self.tree_cache_logits[idx[sel]]
+
+        miss_idx = (~cache_hits.bool()).nonzero(as_tuple=True)[0]
+        if miss_idx.numel() > 0:
+            miss_prefixes = [full_token_lists[i] for i in miss_idx.tolist()]
+            miss_tables = [trimmed_block_tables[i] for i in miss_idx.tolist()]
+            miss_temps = [float(temperatures[i].item()) for i in miss_idx.tolist()]
+            miss_tokens, miss_logits = self._generate_kimi_from_prefixes(
+                miss_prefixes,
+                miss_tables,
+                miss_temps,
+            )
+            out_tokens[miss_idx] = miss_tokens
+            out_logits[miss_idx] = miss_logits
+
+        return (
+            out_tokens,
+            out_logits,
+            make_glue_decode_input_ids(out_tokens, cache_keys[:, 2]),
+            cache_hits,
+            full_token_lists,
+            trimmed_block_tables,
+        )
+
+    def _build_kimi_tree_cache(self, partial_tree_decode_args):
+        B = partial_tree_decode_args["seq_ids"].shape[0]
+        K = self.config.speculate_k
+        cache_hits = partial_tree_decode_args["cache_hits"]
+        cache_hits_list = cache_hits.tolist()
+        returned_tokens = partial_tree_decode_args["returned_tokens"]
+        current_token_ids = partial_tree_decode_args["current_token_ids"]
+        trimmed_block_tables = partial_tree_decode_args["trimmed_dbt"]
+        recovery_tokens = partial_tree_decode_args["recovery_tokens"]
+
+        glue_logits = self._compute_kimi_path_logits(
+            current_token_ids,
+            trimmed_block_tables,
+            returned_tokens,
+        )
+        gd_for_fork = torch.cat([recovery_tokens.unsqueeze(1), returned_tokens], dim=1)
+        forked_recovery_tokens = get_forked_recovery_tokens_from_logits(
+            self.config,
+            glue_logits,
+            cache_hits,
+            gd_for_fork,
+            tokenizer=self.tokenizer,
+        )
+
+        branch_prefixes = []
+        branch_block_tables = []
+        branch_temperatures = []
+        seq_ids_expanded = []
+        rec_flat = []
+
+        returned_tokens_list = returned_tokens.tolist()
+        temperatures_list = partial_tree_decode_args["temperatures"].tolist()
+        seq_ids_list = partial_tree_decode_args["seq_ids"].tolist()
+        fan_hit = self.config.fan_out_list
+        fan_miss = self.config.fan_out_list_miss
+
+        for batch_idx in range(B):
+            cursor = 0
+            base_prefix = current_token_ids[batch_idx]
+            trunk_tokens = returned_tokens_list[batch_idx]
+            fan_list = fan_hit if cache_hits_list[batch_idx] else fan_miss
+            for keep_idx, fanout in enumerate(fan_list):
+                accepted_prefix = base_prefix + trunk_tokens[:keep_idx]
+                fork_tokens = forked_recovery_tokens[batch_idx, cursor:cursor + fanout].tolist()
+                for rec_token in fork_tokens:
+                    branch_prefixes.append(accepted_prefix + [int(rec_token)])
+                    branch_block_tables.append(trimmed_block_tables[batch_idx])
+                    branch_temperatures.append(float(temperatures_list[batch_idx]))
+                    seq_ids_expanded.append(int(seq_ids_list[batch_idx]))
+                    rec_flat.append(int(rec_token))
+                cursor += fanout
+            if cursor != self.config.MQ_LEN:
+                raise RuntimeError(
+                    f"Kimi async tree build expected {self.config.MQ_LEN} branches, got {cursor}.",
+                )
+
+        tokens, logits = self._generate_kimi_from_prefixes(
+            branch_prefixes,
+            branch_block_tables,
+            branch_temperatures,
+        )
+        payload = {
+            "seq_ids_expanded": torch.tensor(
+                seq_ids_expanded,
+                dtype=torch.int64,
+                device=self.device,
+            ),
+            "rec_flat": torch.tensor(
+                rec_flat,
+                dtype=torch.int64,
+                device=self.device,
+            ),
+            "cache_hits": cache_hits,
+            "cache_hits_list": cache_hits_list,
+            "block_tables": partial_tree_decode_args["dbt"],
+        }
+        return payload, tokens, logits
+
     def _service_spec_request(self):
         """Receives a speculation request, serves it from cache, and sends results back in a single response."""
-        meta = self.recv_tensor((3,), torch.int64)
-        B, K, F = meta.tolist()
+        meta = self.recv_tensor((4,), torch.int64)
+        B, K, F, total_cur_tokens = meta.tolist()
 
         # Receive all request payload in one fused int64 burst (includes temperatures encoded as int64)
         max_blocks = self.config.max_blocks
-        fused_total = (3 * B) + B + (B * max_blocks) + B  # +B for temps_as_int64
+        fused_total = (3 * B) + B + (B * max_blocks) + B + total_cur_tokens
         fused_req = recv_int64(self.async_pg, src=0,
                                total_length=fused_total, device=self.device)
         off = 0
@@ -306,8 +603,14 @@ class DraftRunner(ModelRunner):
         off += B * max_blocks
         temps_as_int64 = fused_req[off:off + B]
         off += B
+        full_input_ids = fused_req[off:off + total_cur_tokens]
+        off += total_cur_tokens
         assert off == fused_total
         temperatures = temps_as_int64.to(torch.int32).view(torch.float32)
+        if self._is_kimi_async() and total_cur_tokens != int(num_tokens.sum().item()):
+            raise RuntimeError(
+                f"Kimi async request payload length mismatch: meta={total_cur_tokens} actual={int(num_tokens.sum().item())}.",
+            )
 
         target_recovery_activations = torch.zeros(
             B, 3 * self.config.d_model_target, dtype=self.hf_config.torch_dtype, device=self.device
@@ -342,8 +645,27 @@ class DraftRunner(ModelRunner):
                     print(f"  Seq {seq_id}: keep_idx={keep_idx}, recovery_token={rec_token_target} ('{rec_token_text}'), n_ext={n_ext}", flush=True)
                 print(f"{'='*80}\n", flush=True)
 
-        out_tokens, out_logits, glue_decode_input_ids, cache_hits, out_activations = self.hit_cache_and_respond(
-            cache_keys, B, K, num_tokens, temperatures, draft_block_tables, target_recovery_activations)
+        current_token_ids = None
+        trimmed_block_tables = None
+        if self._is_kimi_async():
+            (
+                out_tokens,
+                out_logits,
+                glue_decode_input_ids,
+                cache_hits,
+                current_token_ids,
+                trimmed_block_tables,
+            ) = self._serve_kimi_request_from_cache(
+                cache_keys,
+                num_tokens,
+                temperatures,
+                draft_block_tables,
+                full_input_ids,
+            )
+            out_activations = None
+        else:
+            out_tokens, out_logits, glue_decode_input_ids, cache_hits, out_activations = self.hit_cache_and_respond(
+                cache_keys, B, K, num_tokens, temperatures, draft_block_tables, target_recovery_activations)
 
         if self.config.verbose:
             print(f"[CACHE RESPONSE]", flush=True)
@@ -374,6 +696,10 @@ class DraftRunner(ModelRunner):
             "extend_eagle_acts": extend_eagle_acts,
             "extend_token_ids": extend_token_ids,
         }
+        if current_token_ids is not None:
+            partial_tree_decode_args["current_token_ids"] = current_token_ids
+            partial_tree_decode_args["trimmed_dbt"] = trimmed_block_tables
+            partial_tree_decode_args["recovery_tokens"] = cache_keys[:, 2].clone()
 
         return glue_decode_input_ids, partial_tree_decode_args
 
@@ -889,21 +1215,33 @@ class DraftRunner(ModelRunner):
 
                 self._reset_tree_cache_tensors()
 
-                tree_decode_args = self._build_tree_batch(partial_tree_decode_args, glue_decode_input_ids)
+                if self._is_kimi_async():
+                    tree_decode_args, tokens, logits = self._build_kimi_tree_cache(partial_tree_decode_args)
 
-                if _prof or PROFILE_DRAFT:
-                    torch.cuda.synchronize()
-                    _d2 = time.perf_counter()
+                    if _prof or PROFILE_DRAFT:
+                        torch.cuda.synchronize()
+                        _d2 = time.perf_counter()
 
-                # Decode the branch tree
-                tokens, logits, activations = self._decode_tree(tree_decode_args)
+                    activations = None
+                    if _prof or PROFILE_DRAFT:
+                        _d3 = _d2
+                    self._populate_tree_cache(tree_decode_args, tokens, logits, tree_decode_args["cache_hits"], activations)
+                else:
+                    tree_decode_args = self._build_tree_batch(partial_tree_decode_args, glue_decode_input_ids)
 
-                if _prof or PROFILE_DRAFT:
-                    torch.cuda.synchronize()
-                    _d3 = time.perf_counter()
+                    if _prof or PROFILE_DRAFT:
+                        torch.cuda.synchronize()
+                        _d2 = time.perf_counter()
 
-                # Populate the local cache so future spec-requests can hit
-                self._populate_tree_cache(tree_decode_args, tokens, logits, tree_decode_args["cache_hits"], activations)
+                    # Decode the branch tree
+                    tokens, logits, activations = self._decode_tree(tree_decode_args)
+
+                    if _prof or PROFILE_DRAFT:
+                        torch.cuda.synchronize()
+                        _d3 = time.perf_counter()
+
+                    # Populate the local cache so future spec-requests can hit
+                    self._populate_tree_cache(tree_decode_args, tokens, logits, tree_decode_args["cache_hits"], activations)
                 self._draft_step_times.append(time.perf_counter() - _ds0)
 
                 if _prof or PROFILE_DRAFT:

@@ -3,7 +3,7 @@ import ssd.paths  # noqa: F401 — sets TORCH_CUDA_ARCH_LIST before flashinfer i
 
 from ssd.config import Config
 from ssd.sampling_params import SamplingParams
-from ssd.utils.misc import infer_model_family
+from ssd.utils.misc import infer_model_family, load_tokenizer
 from ssd.engine.sequence import Sequence
 from ssd.engine.scheduler import Scheduler
 from ssd.engine.model_runner import ModelRunner
@@ -17,7 +17,6 @@ import atexit
 from dataclasses import fields
 from time import perf_counter
 from tqdm.auto import tqdm
-from transformers import AutoTokenizer
 import torch.multiprocessing as mp
 
 
@@ -113,7 +112,7 @@ class LLMEngine:
             self.draft_cfg = self.draft_runner.draft_cfg
             print(f'Draft runner created on rank 0 (no async)', flush=True)
 
-        self.tokenizer = AutoTokenizer.from_pretrained(config.model, use_fast=True)
+        self.tokenizer = load_tokenizer(config.model)
         config.eos = self.tokenizer.eos_token_id
         self.scheduler = Scheduler(config, draft_cfg=self.draft_cfg if config.speculate else None)
         assert config.max_model_len == self.scheduler.max_model_len
@@ -206,6 +205,14 @@ class LLMEngine:
 
         outputs = [(seq.seq_id, seq.completion_token_ids)
                    for seq in seqs if seq.is_finished]
+        if outputs:
+            finished_seq_ids = [seq_id for seq_id, _ in outputs]
+            self.model_runner.call(
+                "cleanup_seq_states",
+                finished_seq_ids,
+            )
+            if self.config.speculate and not self.config.draft_async:
+                self.draft_runner.call("cleanup_seq_states", finished_seq_ids)
 
         return outputs
 
@@ -285,6 +292,7 @@ class LLMEngine:
                     draft_runner_rank=self.num_tp_gpus,
                     tokenizer=self.tokenizer,
                     verbose=config.verbose,
+                    send_current_sequences=getattr(config.hf_config, "model_type", None) == "kimi_linear",
                 )
             else:
                 speculator = SpeculatorSync(

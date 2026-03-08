@@ -1,5 +1,6 @@
 import torch
 from torch import nn
+import torch.nn.functional as F
 import triton
 import triton.language as tl
 
@@ -17,28 +18,42 @@ def store_kvcache_kernel(
     v_cache_ptr,
     slot_mapping_ptr,
     D: tl.constexpr,
+    BLOCK_D: tl.constexpr,
 ):
     idx = tl.program_id(0)
     slot = tl.load(slot_mapping_ptr + idx)
     if slot == -1:
         return
-    key_offsets = idx * key_stride + tl.arange(0, D)
-    value_offsets = idx * value_stride + tl.arange(0, D)
-    key = tl.load(key_ptr + key_offsets)
-    value = tl.load(value_ptr + value_offsets)
-    cache_offsets = slot.to(tl.int64) * D + tl.arange(0, D)
-    tl.store(k_cache_ptr + cache_offsets, key)
-    tl.store(v_cache_ptr + cache_offsets, value)
+    offs = tl.arange(0, BLOCK_D)
+    mask = offs < D
+    key_offsets = idx * key_stride + offs
+    value_offsets = idx * value_stride + offs
+    key = tl.load(key_ptr + key_offsets, mask=mask)
+    value = tl.load(value_ptr + value_offsets, mask=mask)
+    cache_offsets = slot.to(tl.int64) * D + offs
+    tl.store(k_cache_ptr + cache_offsets, key, mask=mask)
+    tl.store(v_cache_ptr + cache_offsets, value, mask=mask)
 
 
 def store_kvcache(key: torch.Tensor, value: torch.Tensor, k_cache: torch.Tensor, v_cache: torch.Tensor, slot_mapping: torch.Tensor):
     N, num_heads, head_dim = key.shape
     D = num_heads * head_dim
+    block_d = 1 << (D - 1).bit_length()
     assert key.stride(-1) == 1 and value.stride(-1) == 1
     assert key.stride(1) == head_dim and value.stride(1) == head_dim
     assert k_cache.stride(1) == D and v_cache.stride(1) == D
     assert slot_mapping.numel() == N
-    store_kvcache_kernel[(N,)](key, key.stride(0), value, value.stride(0), k_cache, v_cache, slot_mapping, D)
+    store_kvcache_kernel[(N,)](
+        key,
+        key.stride(0),
+        value,
+        value.stride(0),
+        k_cache,
+        v_cache,
+        slot_mapping,
+        D=D,
+        BLOCK_D=block_d,
+    )
 
 class Attention(nn.Module):
 
@@ -70,11 +85,97 @@ class Attention(nn.Module):
         self.K = K # speculate_k
         self.only_prefill_wrapper = None
 
+    def _expand_kv_heads(self, x: torch.Tensor) -> torch.Tensor:
+        if self.num_kv_heads == self.num_heads:
+            return x
+        repeat = self.num_heads // self.num_kv_heads
+        return x.repeat_interleave(repeat, dim=1)
+
+    def _gather_paged_kv(
+        self,
+        cache: torch.Tensor,
+        block_table: torch.Tensor,
+        context_len: int,
+    ) -> torch.Tensor:
+        if context_len == 0:
+            return cache.new_empty((0, self.num_kv_heads, self.head_dim))
+        blocks = []
+        remaining = context_len
+        for block_id in block_table.tolist():
+            if block_id < 0 or remaining <= 0:
+                break
+            take = min(remaining, cache.shape[1])
+            blocks.append(cache[block_id, :take])
+            remaining -= take
+        return torch.cat(blocks, dim=0)
+
+    def _sdpa(self, q: torch.Tensor, k: torch.Tensor, v: torch.Tensor) -> torch.Tensor:
+        k = self._expand_kv_heads(k)
+        v = self._expand_kv_heads(v)
+        q_t = q.transpose(0, 1).unsqueeze(0)
+        k_t = k.transpose(0, 1).unsqueeze(0)
+        v_t = v.transpose(0, 1).unsqueeze(0)
+        out = F.scaled_dot_product_attention(
+            q_t,
+            k_t,
+            v_t,
+            is_causal=True,
+            scale=self.scale,
+        )
+        return out.squeeze(0).transpose(0, 1)
+
+    def _prefill_fallback(
+        self,
+        q: torch.Tensor,
+        k: torch.Tensor,
+        v: torch.Tensor,
+        context,
+    ) -> torch.Tensor:
+        outs = []
+        batch_size = context.cu_seqlens_q.numel() - 1
+        for i in range(batch_size):
+            q0 = int(context.cu_seqlens_q[i].item())
+            q1 = int(context.cu_seqlens_q[i + 1].item())
+            q_seq = q[q0:q1]
+            if context.block_tables is None:
+                k0 = int(context.cu_seqlens_k[i].item())
+                k1 = int(context.cu_seqlens_k[i + 1].item())
+                k_seq = k[k0:k1]
+                v_seq = v[k0:k1]
+            else:
+                context_len = int(context.cu_seqlens_k[i + 1].item() - context.cu_seqlens_k[i].item())
+                k_seq = self._gather_paged_kv(self.k_cache, context.block_tables[i], context_len)
+                v_seq = self._gather_paged_kv(self.v_cache, context.block_tables[i], context_len)
+            outs.append(self._sdpa(q_seq, k_seq, v_seq))
+        return torch.cat(outs, dim=0)
+
+    def _decode_fallback(self, q: torch.Tensor, context) -> torch.Tensor:
+        outs = []
+        if context.cu_seqlens_q is None:
+            batch_size = q.shape[0]
+            q_splits = [(i, i + 1) for i in range(batch_size)]
+        else:
+            batch_size = context.cu_seqlens_q.numel() - 1
+            q_splits = [
+                (int(context.cu_seqlens_q[i].item()), int(context.cu_seqlens_q[i + 1].item()))
+                for i in range(batch_size)
+            ]
+        for i, (q0, q1) in enumerate(q_splits):
+            q_seq = q[q0:q1]
+            context_len = int(context.context_lens[i].item())
+            k_seq = self._gather_paged_kv(self.k_cache, context.block_tables[i], context_len)
+            v_seq = self._gather_paged_kv(self.v_cache, context.block_tables[i], context_len)
+            outs.append(self._sdpa(q_seq, k_seq, v_seq))
+        return torch.cat(outs, dim=0)
+
     def forward(self, q: torch.Tensor, k: torch.Tensor, v: torch.Tensor):
         o: torch.Tensor
         q = q.view(-1, self.num_heads, self.head_dim)
         k = k.view(-1, self.num_kv_heads, self.head_dim)
         v = v.view(-1, self.num_kv_heads, self.head_dim)
+        flash_kwargs = {}
+        if q.is_cuda and torch.cuda.get_device_capability(q.device)[0] >= 12:
+            flash_kwargs["ver"] = 4
 
         k_cache, v_cache = self.k_cache, self.v_cache
 
@@ -87,10 +188,13 @@ class Attention(nn.Module):
                 k, v = k_cache, v_cache
 
             k, v = k.view(-1, self.num_kv_heads, self.head_dim), v.view(-1, self.num_kv_heads, self.head_dim)
-            o = flash_attn_varlen_func(q, k, v,
-                                       max_seqlen_q=context.max_seqlen_q, cu_seqlens_q=context.cu_seqlens_q,
-                                       max_seqlen_k=context.max_seqlen_k, cu_seqlens_k=context.cu_seqlens_k,
-                                       softmax_scale=self.scale, causal=True)
+            try:
+                o = flash_attn_varlen_func(q, k, v,
+                                           max_seqlen_q=context.max_seqlen_q, cu_seqlens_q=context.cu_seqlens_q,
+                                           max_seqlen_k=context.max_seqlen_k, cu_seqlens_k=context.cu_seqlens_k,
+                                           softmax_scale=self.scale, causal=True, **flash_kwargs)
+            except (AssertionError, RuntimeError):
+                o = self._prefill_fallback(q, k, v, context)
         else:
             # verify/glue decode: multi-query with cu_seqlens_q (K+1 or variable per seq)
             verify_or_glue = (
@@ -104,11 +208,14 @@ class Attention(nn.Module):
 
             if verify_or_glue:
                 assert context.context_lens is not None
-                o = flash_attn_with_kvcache(q, k_cache, v_cache,
-                                        cache_seqlens=context.context_lens, page_table=context.block_tables,
-                                        softmax_scale=self.scale, causal=True,
-                                        cu_seqlens_q=context.cu_seqlens_q, max_seqlen_q=context.max_seqlen_q,
-                                        )
+                try:
+                    o = flash_attn_with_kvcache(q, k_cache, v_cache,
+                                            cache_seqlens=context.context_lens, page_table=context.block_tables,
+                                            softmax_scale=self.scale, causal=True,
+                                            cu_seqlens_q=context.cu_seqlens_q, max_seqlen_q=context.max_seqlen_q,
+                                            **flash_kwargs)
+                except (AssertionError, RuntimeError):
+                    o = self._decode_fallback(q, context)
 
             elif tree_decode:
                 if self.only_prefill_wrapper is not None:
@@ -125,10 +232,14 @@ class Attention(nn.Module):
                 o = prefill_wrapper.run(q, (self.k_cache, self.v_cache))
             else: # single query decode
                 q = q.unsqueeze(1)
-                o = flash_attn_with_kvcache(q, k_cache, v_cache,
-                                            cache_seqlens=context.context_lens, page_table=context.block_tables,
-                                            softmax_scale=self.scale, causal=True,
-                                            )
+                try:
+                    o = flash_attn_with_kvcache(q, k_cache, v_cache,
+                                                cache_seqlens=context.context_lens, page_table=context.block_tables,
+                                                softmax_scale=self.scale, causal=True,
+                                                **flash_kwargs,
+                                                )
+                except (AssertionError, RuntimeError):
+                    o = self._decode_fallback(q.squeeze(1), context)
 
         o = o.view(-1, self.num_heads * self.head_dim)
         return o

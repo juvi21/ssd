@@ -25,6 +25,7 @@ class SpeculatorAsync(SpeculatorBase):
         draft_runner_rank: int,
         tokenizer: AutoTokenizer,
         verbose: bool,
+        send_current_sequences: bool = False,
     ):
         super().__init__(lookahead, device)
         self.async_fan_out = async_fan_out
@@ -37,6 +38,7 @@ class SpeculatorAsync(SpeculatorBase):
         self.draft_runner_rank = draft_runner_rank
         self.tokenizer = tokenizer
         self.verbose = verbose
+        self.send_current_sequences = send_current_sequences
         self.K = lookahead
 
         # Pre-allocate handshake send/recv buffers (reused every step)
@@ -50,7 +52,7 @@ class SpeculatorAsync(SpeculatorBase):
         self._hs_B = B
         d = self.device
         self._cmd = torch.zeros(1, dtype=torch.int64, device=d)
-        self._meta = torch.tensor([B, self.K, self.async_fan_out], dtype=torch.int64, device=d)
+        self._meta = torch.tensor([B, self.K, self.async_fan_out, 0], dtype=torch.int64, device=d)
         self._cache_keys = torch.empty(B, 3, dtype=torch.int64, device=d)
         self._num_tokens_buf = torch.empty(B, dtype=torch.int64, device=d)
         self._temps_buf = torch.empty(B, dtype=torch.float32, device=d)
@@ -60,6 +62,9 @@ class SpeculatorAsync(SpeculatorBase):
         self._extend_counts = torch.zeros(B, dtype=torch.int64, device=d)
 
     def prefill(self, seqs: list[Sequence], verify_result: VerifyResult) -> SpeculateResult:
+        if self.send_current_sequences:
+            return SpeculateResult([], [])
+
         eagle_acts = verify_result.eagle_acts
         input_id_list = [seq.token_ids for seq in seqs]
 
@@ -132,6 +137,12 @@ class SpeculatorAsync(SpeculatorBase):
         if B != self._hs_B:
             self._alloc_handshake_bufs(B)
 
+        total_cur_tokens = sum(len(seq.token_ids) for seq in seqs) if self.send_current_sequences else 0
+        self._meta[0] = B
+        self._meta[1] = self.K
+        self._meta[2] = self.async_fan_out
+        self._meta[3] = total_cur_tokens
+
         # Fill send buffers in-place (avoids torch.tensor from Python lists)
         for i, seq in enumerate(seqs):
             self._cache_keys[i, 0] = seq.seq_id
@@ -149,10 +160,23 @@ class SpeculatorAsync(SpeculatorBase):
         dist.send(self._cmd, dst=self.draft_runner_rank, group=self.async_pg)
         dist.send(self._meta, dst=self.draft_runner_rank, group=self.async_pg)
         temps_as_int64 = self._temps_buf.view(torch.int32).to(torch.int64)
+        payload = [
+            self._cache_keys,
+            self._num_tokens_buf,
+            self._block_tables_buf.to(torch.int64),
+            temps_as_int64,
+        ]
+        if total_cur_tokens > 0:
+            payload.append(
+                torch.tensor(
+                    [token for seq in seqs for token in seq.token_ids],
+                    dtype=torch.int64,
+                    device=self.device,
+                ),
+            )
         send_int64(
             self.async_pg, self.draft_runner_rank,
-            self._cache_keys, self._num_tokens_buf,
-            self._block_tables_buf.to(torch.int64), temps_as_int64,
+            *payload,
         )
 
         if eagle:

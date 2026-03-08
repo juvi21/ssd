@@ -5,17 +5,19 @@ import torch
 import torch.distributed as dist
 from multiprocessing.synchronize import Event
 from multiprocessing.shared_memory import SharedMemory
-from transformers import AutoTokenizer, AutoConfig
+from transformers import AutoConfig
 import os
 import flashinfer
 from ssd.config import Config
 from ssd.engine.sequence import Sequence
 from ssd.models.qwen3 import Qwen3ForCausalLM
 from ssd.models.llama3 import LlamaForCausalLM
+from ssd.models.kimi_linear import KimiLinearForCausalLM
 from ssd.models.eagle3_draft_llama3 import Eagle3DraftForCausalLM
 from ssd.layers.sampler import Sampler
 from ssd.utils.context import set_context, reset_context, get_context
 from ssd.utils.loader import load_model
+from ssd.utils.misc import load_tokenizer
 from ssd.engine.helpers.runner_helpers import (
     prepare_decode_tensors_from_seqs, 
     prepare_block_tables_from_seqs, 
@@ -52,7 +54,8 @@ class ModelRunner:
         self.hf_config = config.hf_config if not is_draft else config.draft_hf_config
         self.block_size = config.kvcache_block_size
         self.enforce_eager = config.enforce_eager
-        self.tokenizer = AutoTokenizer.from_pretrained(config.tokenizer_path if config.tokenizer_path else config.model, use_fast=True)
+        tokenizer_path = config.tokenizer_path if config.tokenizer_path else config.model
+        self.tokenizer = load_tokenizer(tokenizer_path)
         self.max_num_blocks = (config.max_model_len + self.block_size - 1) // self.block_size
 
         assert self.hf_config is not None, "ERROR in ModelRunner: hf_config is None" # this implies boundedness to the end 
@@ -221,6 +224,8 @@ class ModelRunner:
             model_class = LlamaForCausalLM
         elif hf_config.model_type == 'qwen3':
             model_class = Qwen3ForCausalLM
+        elif hf_config.model_type == 'kimi_linear':
+            model_class = KimiLinearForCausalLM
         else:
             raise ValueError(f"Unsupported model type: {hf_config.model_type}")
 
@@ -441,6 +446,7 @@ class ModelRunner:
             hidden_states = torch.zeros(num_tokens, 3 * d_model_target, dtype=self.hf_config.torch_dtype, device=self.device)
         
         self.run(seqs, True, hidden_states=hidden_states)
+        self.cleanup_seq_states([seq.seq_id for seq in seqs])
         torch.cuda.empty_cache()
 
     def allocate_kv_cache(self):
@@ -449,14 +455,24 @@ class ModelRunner:
         hf_config = self.hf_config
         
         # Simplify: just look at free memory on the GPU, and allocate up to gpu_memory_utilization * free.
+        cache_modules = [
+            module for module in self.model.modules()
+            if hasattr(module, "k_cache") and hasattr(module, "v_cache")
+        ]
+        if not cache_modules:
+            config.num_kvcache_blocks = 1
+            return
+
         free, _ = torch.cuda.mem_get_info()
-        num_kv_heads = hf_config.num_key_value_heads // self.num_tp_gpus
+        num_kv_heads = cache_modules[0].num_kv_heads
+        head_dim = cache_modules[0].head_dim
+        num_cache_layers = len(cache_modules)
         block_bytes = (
             2
-            * hf_config.num_hidden_layers
+            * num_cache_layers
             * self.block_size
             * num_kv_heads
-            * hf_config.head_dim
+            * head_dim
             * hf_config.torch_dtype.itemsize
         )
         usable_bytes = free * config.gpu_memory_utilization
@@ -483,27 +499,27 @@ class ModelRunner:
 
         self.kv_cache = torch.zeros( 
             2,
-            hf_config.num_hidden_layers,
+            num_cache_layers,
             config.num_kvcache_blocks,
             self.block_size,
             num_kv_heads,
-            hf_config.head_dim, 
+            head_dim, 
         )
         
         print(f"allocate_kv_cache(): kv_cache shape = {self.kv_cache.shape}", flush=True)
         layer_id = 0
-        for module in self.model.modules():
-            if hasattr(module, "k_cache") and hasattr(module, "v_cache"):
-                module.k_cache = self.kv_cache[0, layer_id]
-                module.v_cache = self.kv_cache[1, layer_id]
-                if self.is_draft and self.draft_async and not self.enforce_eager:
-                    module.prefill_wrappers = self.prefill_wrappers
-                elif self.is_draft and self.draft_async and self.enforce_eager:
-                    module.only_prefill_wrapper = self.only_prefill_wrapper # this will make it not None so it can be used on fwd
-                layer_id += 1
+        for module in cache_modules:
+            module.k_cache = self.kv_cache[0, layer_id]
+            module.v_cache = self.kv_cache[1, layer_id]
+            if self.is_draft and self.draft_async and not self.enforce_eager:
+                module.prefill_wrappers = self.prefill_wrappers
+            elif self.is_draft and self.draft_async and self.enforce_eager:
+                module.only_prefill_wrapper = self.only_prefill_wrapper # this will make it not None so it can be used on fwd
+            layer_id += 1
 
     
     def prepare_prefill(self, seqs: list[Sequence]):
+        self.prepare_model_states(seqs, is_prefill=True)
         input_ids, positions, cu_seqlens_q, cu_seqlens_k, max_seqlen_q, max_seqlen_k, slot_mapping = \
             prepare_prefill_tensors_from_seqs(seqs, self.block_size, self.is_draft) # if one big input ids, how is attn mask handled? via cu_seqlens_q/k? 
 
@@ -513,10 +529,12 @@ class ModelRunner:
                 seqs, self.is_draft)
         
         set_context(is_prefill=True, cu_seqlens_q=cu_seqlens_q, cu_seqlens_k=cu_seqlens_k, max_seqlen_q=max_seqlen_q,
-                    max_seqlen_k=max_seqlen_k, slot_mapping=slot_mapping, context_lens=None, block_tables=block_tables)
+                    max_seqlen_k=max_seqlen_k, slot_mapping=slot_mapping, context_lens=None, block_tables=block_tables,
+                    seq_ids=[seq.seq_id for seq in seqs])
         return input_ids, positions
     
     def prepare_decode(self, seqs: list[Sequence], verify: bool = False): 
+        self.prepare_model_states(seqs, is_prefill=False)
         input_ids, positions, slot_mapping, context_lens = \
             prepare_decode_tensors_from_seqs(seqs, self.block_size, self.is_draft, verify, self.config.speculate_k if verify else -1)
 
@@ -531,13 +549,21 @@ class ModelRunner:
             set_context(is_prefill=False, cu_seqlens_q=cu_seqlens_q, cu_seqlens_k=None, 
                        max_seqlen_q=self.config.speculate_k + 1, max_seqlen_k=0,
                        slot_mapping=slot_mapping, context_lens=context_lens, 
-                       block_tables=block_tables) 
+                       block_tables=block_tables, seq_ids=[seq.seq_id for seq in seqs]) 
         else: # sq_decode path, draft (sync spec) or target (normal)
             set_context(is_prefill=False, cu_seqlens_q=None, cu_seqlens_k=None, 
                        max_seqlen_q=0, max_seqlen_k=0, slot_mapping=slot_mapping, 
-                       context_lens=context_lens, block_tables=block_tables)
+                       context_lens=context_lens, block_tables=block_tables, seq_ids=[seq.seq_id for seq in seqs])
         
         return input_ids, positions
+
+    def prepare_model_states(self, seqs: list[Sequence], is_prefill: bool):
+        if hasattr(self.model, "prepare_for_run"):
+            self.model.prepare_for_run(seqs, is_prefill)
+
+    def cleanup_seq_states(self, seq_ids: list[int]):
+        if hasattr(self.model, "cleanup_seq_states"):
+            self.model.cleanup_seq_states(seq_ids)
 
     def prepare_sample(self, seqs: list[Sequence]):
         temperatures = []
@@ -548,6 +574,49 @@ class ModelRunner:
                 temperatures.append(seq.temperature)
         temperatures = torch.tensor(temperatures, dtype=torch.float32, pin_memory=True).cuda(non_blocking=True)
         return temperatures
+
+    def _use_kimi_spec_recompute(self) -> bool:
+        return (
+            getattr(self.hf_config, "model_type", None) == "kimi_linear"
+            and self.config.speculate
+            and (not self.is_draft or not self.config.draft_async)
+        )
+
+    def _run_kimi_spec_recompute(
+        self,
+        seqs: list[Sequence],
+        last_only: bool,
+        draft_return_logits: bool,
+    ):
+        # Kimi KDA state cannot be rolled back like paged KV, so speculative paths
+        # use exact full-sequence recomputation each step.
+        seqs_copy = [seq.clone_spec() for seq in seqs]
+        for seq in seqs_copy:
+            seq.num_cached_tokens = 0
+            seq.num_draft_cached_tokens = 0
+
+        input_ids, positions = self.prepare_prefill(seqs_copy)
+        temperatures = self.prepare_sample(seqs) if self.rank == 0 else None
+        if last_only:
+            logits = self.run_model(input_ids, positions, is_prefill=True, last_only=True)
+        else:
+            outputs = self.model(input_ids, positions)
+            logits = self.model.compute_logits(outputs, last_only=False)
+
+        if last_only:
+            token_ids = self.sampler(logits, temperatures).tolist() if self.rank == 0 else None
+            reset_context()
+            return (token_ids, logits) if draft_return_logits else token_ids
+
+        context = get_context()
+        per_seq_logits = []
+        k_plus_1 = self.config.speculate_k + 1
+        for i in range(len(seqs_copy)):
+            start = int(context.cu_seqlens_q[i].item())
+            end = int(context.cu_seqlens_q[i + 1].item())
+            per_seq_logits.append(logits[end - k_plus_1:end])
+        reset_context()
+        return torch.cat(per_seq_logits, dim=0)
 
     def eager_tree_decode_plan(self, input_ids, positions, step, cache_hits):
         """Plan FlashInfer for tree decode in eager mode"""
@@ -639,6 +708,9 @@ class ModelRunner:
         draft_return_logits: bool = False,
         hidden_states: torch.Tensor | None = None
     ) -> list[int] | tuple[list[int], torch.Tensor]:
+        if self._use_kimi_spec_recompute() and not is_prefill:
+            return self._run_kimi_spec_recompute(seqs, last_only, draft_return_logits)
+
         _pt = os.environ.get("SSD_PROFILE_TARGET", "0") == "1" and not is_prefill and not last_only
         if _pt:
             torch.cuda.synchronize()
@@ -679,4 +751,3 @@ class ModelRunner:
                 return logits, conditioning
             return logits
     
-

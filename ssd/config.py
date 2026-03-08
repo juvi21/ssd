@@ -3,6 +3,7 @@ from dataclasses import dataclass
 from transformers import AutoConfig
 import torch
 from ssd.paths import DEFAULT_TARGET, DEFAULT_DRAFT
+from ssd.utils.misc import infer_model_family, load_model_config
 
 @dataclass
 class Config:
@@ -43,6 +44,7 @@ class Config:
     verbose: bool = False 
     debug_mode: bool = False 
     max_steps: int | None = None
+    disable_prefix_cache: bool = False
 
     @property
     def max_blocks(self): 
@@ -53,14 +55,31 @@ class Config:
         assert os.path.isdir(model)
 
         assert 1 <= self.num_gpus <= 8 # this codebase only works on one node 
-        self.hf_config = AutoConfig.from_pretrained(model)
-        self.max_model_len = min(
-            self.max_model_len, self.hf_config.max_position_embeddings) 
+        self.hf_config = load_model_config(model)
+        if getattr(self.hf_config, "model_type", None) == "kimi_linear":
+            self.disable_prefix_cache = True
+            self.enforce_eager = True
+        target_max_len = getattr(
+            self.hf_config,
+            "max_position_embeddings",
+            getattr(self.hf_config, "model_max_length", self.max_model_len),
+        )
+        self.max_model_len = min(self.max_model_len, target_max_len)
         if self.speculate: 
+            if (
+                getattr(self.hf_config, "model_type", None) == "kimi_linear"
+                and infer_model_family(self.draft) != "kimi"
+            ):
+                print("[Config] No Kimi draft configured; defaulting draft model to target model.", flush=True)
+                self.draft = self.model
             draft = self.draft
-            self.draft_hf_config = AutoConfig.from_pretrained(draft)
-            self.max_model_len = min(
-                self.max_model_len, self.draft_hf_config.max_position_embeddings)
+            self.draft_hf_config = load_model_config(draft)
+            draft_max_len = getattr(
+                self.draft_hf_config,
+                "max_position_embeddings",
+                getattr(self.draft_hf_config, "model_max_length", self.max_model_len),
+            )
+            self.max_model_len = min(self.max_model_len, draft_max_len)
             if self.draft_async:
                 if self.fan_out_list is None: 
                     self.fan_out_list = [self.async_fan_out] * (self.speculate_k + 1)

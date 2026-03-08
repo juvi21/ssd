@@ -7,9 +7,9 @@ import json
 from random import randint, seed
 from ssd import LLM, SamplingParams
 from ssd.engine.llm_engine import METRICS
-from transformers import AutoTokenizer
 import wandb
 from bench_helpers import get_model_paths, generate_benchmark_inputs
+from ssd.utils.misc import load_tokenizer
 
 
 def parse_arguments():
@@ -285,7 +285,7 @@ def main():
         for i, prompt in enumerate(prompts):
             if isinstance(prompt, str):
                 print(f'Prompt: {prompt}')
-                tokenizer = AutoTokenizer.from_pretrained(model_path)
+                tokenizer = load_tokenizer(model_path)
                 num_tokens = len(tokenizer.encode(prompt, add_special_tokens=False))
             elif isinstance(prompt, list):
                 num_tokens = len(prompt)
@@ -365,7 +365,7 @@ def main():
                 print("GENERATIONS:")
                 print("="*80)
 
-                tokenizer = AutoTokenizer.from_pretrained(model_path)
+                tokenizer = load_tokenizer(model_path)
 
                 for i, (prompt, output) in enumerate(zip(prompts, outputs)):
                     if i >= 10:

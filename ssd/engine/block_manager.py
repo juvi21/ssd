@@ -32,7 +32,8 @@ class BlockManager:
         is_draft: bool = False, 
         speculate_k: int = -1, 
         max_model_len: int = -1,
-        verbose: bool = False
+        verbose: bool = False,
+        disable_prefix_cache: bool = False,
     ):
         assert num_blocks > 0
         self.block_size = block_size
@@ -44,6 +45,7 @@ class BlockManager:
         self.speculate_k: int = speculate_k 
         self.verbose: bool = verbose
         self.max_model_len: int = max_model_len
+        self.disable_prefix_cache: bool = disable_prefix_cache
 
         
     @classmethod
@@ -99,6 +101,11 @@ class BlockManager:
     def allocate(self, seq: Sequence):
         block_table = seq.draft_block_table if self.is_draft else seq.block_table
         assert not block_table 
+        if self.disable_prefix_cache:
+            for _ in range(seq.num_blocks):
+                block = self._allocate_block(self.free_block_ids[0])
+                block_table.append(block.block_id)
+            return
         h = -1 
         cache_miss = False
 
@@ -174,4 +181,3 @@ class BlockManager:
             new_blocks = self._allocate_n_blocks(needed)
             for block in new_blocks:
                 block_table.append(block.block_id)
-

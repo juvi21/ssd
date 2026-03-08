@@ -4,7 +4,7 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..'))
 import json
 from random import randint
 from typing import List, Optional, Tuple
-from transformers import AutoTokenizer
+from ssd.utils.misc import load_tokenizer
 try:
     from ssd.paths import DATASET_PATHS, HF_CACHE_DIR, EAGLE3_SPECFORGE_70B, EAGLE3_YUHUILI_8B, EAGLE3_QWEN_32B
 except ImportError:
@@ -163,7 +163,7 @@ def load_dataset_token_ids(
         return None
 
     try:
-        tokenizer = AutoTokenizer.from_pretrained(model_path)
+        tokenizer = load_tokenizer(model_path)
         prompts: List[List[int]] = []
         with open(dataset_file_path, "r") as f:
             for _, line in enumerate(f):
@@ -247,7 +247,7 @@ def generate_benchmark_inputs(
         num_prompts = min(args.numseqs, len(example_prompts))
         selected_prompts = example_prompts[:num_prompts]
 
-        tokenizer = AutoTokenizer.from_pretrained(model_path)
+        tokenizer = load_tokenizer(model_path)
         string_prompts = selected_prompts
         return string_prompts, None, selected_prompts
 
