@@ -215,3 +215,17 @@ Compare `token_ids` exactly at `temperature=0.0`.
 - More GPUs help only if:
   - the target can use a divisible TP size, and
   - the draft is smaller or multi-GPU.
+
+## Extra Observation
+
+On a 5-GPU machine, the first meaningful Kimi SSD comparison is:
+
+- SSD on 5 total GPUs = 4 target GPUs + 1 draft GPU
+- versus AR on 4 target GPUs
+
+Do not treat "AR on 5 GPUs" as the main baseline for Kimi in the current code. A 5-way target TP split is not a valid Kimi topology under the repo's current equal-shard assumptions, while async SSD on 5 total GPUs gives the target a 4-way TP split, which is valid for Kimi's current dimensions.
+
+Whether SSD is actually faster than AR on that machine is still empirical:
+
+- likely yes only if the Kimi draft is much cheaper than the 48B target and acceptance/cache-hit rates are good
+- not guaranteed if the draft is too heavy or the acceptance rate is poor
