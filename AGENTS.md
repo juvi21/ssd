@@ -57,6 +57,16 @@ Local snapshot path used during validation:
 - A short AR sanity check generated coherent English output.
 - A larger AR benchmark also completed successfully.
 
+## Proof Status
+
+Current proof status is:
+
+- Kimi AR: proven working on this machine
+- Kimi sync speculative decoding: not yet proven correct
+- Kimi async SSD: not yet proven correct
+
+Important: do not claim that Kimi SSD is fully correct or fully tested from this handoff alone. The implementation is still in-progress. The missing piece is an end-to-end exactness validation against AR at `temperature=0`.
+
 AR benchmark used:
 
 ```bash
@@ -161,6 +171,35 @@ Minimum path:
 - AR vs sync speculative
 - AR vs async SSD
 - Match token IDs exactly before benchmarking
+
+## Required Tests Before Claiming Kimi SSD Works
+
+The following must all pass before saying the Kimi speculative / SSD implementation is correct:
+
+1. AR reference run
+- Run deterministic AR with `temperature=0.0`
+- Save exact `token_ids`
+
+2. Sync speculative exactness
+- Run sync speculative with the same prompts and `temperature=0.0`
+- Compare output `token_ids` exactly to AR
+
+3. Async SSD exactness
+- Run async SSD with the same prompts and `temperature=0.0`
+- Compare output `token_ids` exactly to AR
+
+4. Multi-prompt validation
+- Do not validate on only one prompt
+- Use at least a small prompt set covering short and medium prompt lengths
+
+5. Stability check
+- Repeat the deterministic comparison more than once
+- Confirm results are stable across reruns
+
+6. Benchmark only after exactness passes
+- Compare SSD throughput only after AR/token exactness is established
+
+If any of the exactness checks fail, treat the implementation as unproven even if it appears to run.
 
 ## Recommended Test Plan On A More Powerful Machine
 
